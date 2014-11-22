@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/ActiveState/tail"
@@ -39,20 +38,24 @@ func (c *Communicator) Start(remote *packer.RemoteCmd) error {
 	outputFile.Close()
 
 	// This file will store the exit code of the command once it is complete.
-	exitCodePath := outputFile.Name() + "-exit"
+	exitFile, err := os.Create( outputFile.Name() + "-exit" ) 
+	if err != nil {
+		return err
+	}
+	exitFile.Close()
 
 	cmd := exec.Command("docker", "attach", c.ContainerId)
 	stdin_w, err := cmd.StdinPipe()
 	if err != nil {
 		// We have to do some cleanup since run was never called
 		os.Remove(outputFile.Name())
-		os.Remove(exitCodePath)
+		os.Remove(exitFile.Name())
 
 		return err
 	}
 
 	// Run the actual command in a goroutine so that Start doesn't block
-	go c.run(cmd, remote, stdin_w, outputFile, exitCodePath)
+	go c.run(cmd, remote, stdin_w, outputFile, exitFile)
 
 	return nil
 }
@@ -74,8 +77,9 @@ func (c *Communicator) Upload(dst string, src io.Reader, fi *os.FileInfo) error 
 
 	// Copy the file into place by copying the temporary file we put
 	// into the shared folder into the proper location in the container
+	// Need to remove existing if multiple calls to 'shell' are made.
 	cmd := &packer.RemoteCmd{
-		Command: fmt.Sprintf("command cp %s/%s %s", c.ContainerDir,
+		Command: fmt.Sprintf("rm -f %s; cp -f %s/%s %s", dst, c.ContainerDir,
 			filepath.Base(tempfile.Name()), dst),
 	}
 
@@ -187,7 +191,7 @@ func (c *Communicator) Download(src string, dst io.Writer) error {
 }
 
 // Runs the given command and blocks until completion
-func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.WriteCloser, outputFile *os.File, exitCodePath string) {
+func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.WriteCloser, outputFile *os.File, exitFile *os.File) {
 	// For Docker, remote communication must be serialized since it
 	// only supports single execution.
 	c.lock.Lock()
@@ -195,10 +199,11 @@ func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.W
 
 	// Clean up after ourselves by removing our temporary files
 	defer os.Remove(outputFile.Name())
-	defer os.Remove(exitCodePath)
+	defer os.Remove(exitFile.Name())
 
 	// Tail the output file and send the data to the stdout listener
-	tail, err := tail.TailFile(outputFile.Name(), tail.Config{
+	log.Printf( "Starting tail on output file: %s", outputFile.Name() )
+	outputTail, err := tail.TailFile(outputFile.Name(), tail.Config{
 		Poll:   true,
 		ReOpen: true,
 		Follow: true,
@@ -208,7 +213,21 @@ func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.W
 		remote.SetExited(254)
 		return
 	}
-	defer tail.Stop()
+	defer outputTail.Stop()
+
+	// Tail the output file and send the data to the stdout listener
+	log.Printf( "Startin tail on exit file: %s", exitFile.Name() )
+	exitTail, err := tail.TailFile( exitFile.Name(), tail.Config{
+		Poll:   true,
+		ReOpen: true,
+		Follow: true,
+	})
+	if err != nil {
+		log.Printf("Error tailing exit file: %s", err)
+		remote.SetExited(254)
+		return
+	}
+	defer exitTail.Stop()
 
 	// Modify the remote command so that all the output of the commands
 	// go to a single file and so that the exit code is redirected to
@@ -219,7 +238,7 @@ func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.W
 	remoteCmd := fmt.Sprintf("(%s) >%s 2>&1; echo $? >%s",
 		remote.Command,
 		filepath.Join(c.ContainerDir, filepath.Base(outputFile.Name())),
-		filepath.Join(c.ContainerDir, filepath.Base(exitCodePath)))
+		filepath.Join(c.ContainerDir, filepath.Base(exitFile.Name())))
 
 	// Start the command
 	log.Printf("Executing in container %s: %#v", c.ContainerId, remoteCmd)
@@ -251,9 +270,9 @@ func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.W
 
 		for {
 			select {
-			case <-tail.Dead():
+			case <-outputTail.Dead():
 				return
-			case line := <-tail.Lines:
+			case line := <-outputTail.Lines:
 				if remote.Stdout != nil {
 					remote.Stdout.Write([]byte(line.Text + "\n"))
 				} else {
@@ -271,52 +290,32 @@ func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.W
 			}
 		}
 	}()
+	
+	log.Printf("Start Listening for exit status output")
+	exitStatus := 254
+	for { 
+		select { 
 
-	var exitRaw []byte
-	var exitStatus int
-	var exitStatusRaw int64
-	err = cmd.Wait()
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		exitStatus = 1
-
-		// There is no process-independent way to get the REAL
-		// exit status so we just try to go deeper.
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-			exitStatus = status.ExitStatus()
+			case <-exitTail.Dead():
+				goto REMOTE_EXIT
+			
+			case exitRaw := <-exitTail.Lines:
+				log.Printf("Exit -exit Output: %#v", exitRaw.Text)
+				exitStatusRaw, err := strconv.ParseInt(string(bytes.TrimSpace([]byte(exitRaw.Text))), 10, 0)
+				if err != nil {
+					log.Printf("Error executing: %s", err)
+					goto REMOTE_EXIT
+				}
+				exitStatus = int(exitStatusRaw)
+				log.Printf("Executed command exit status: %d", exitStatus)
+				goto REMOTE_EXIT
+							
+			case <- time.After( 10 * time.Minute ) : 
+				log.Printf("Timer Expired, Build failed" )
+				goto REMOTE_EXIT
+				
 		}
-
-		// Say that we ended, since if Docker itself failed, then
-		// the command must've not run, or so we assume
-		goto REMOTE_EXIT
 	}
-
-	// Wait for the exit code to appear in our file...
-	log.Println("Waiting for exit code to appear for remote command...")
-	for {
-		fi, err := os.Stat(exitCodePath)
-		if err == nil && fi.Size() > 0 {
-			break
-		}
-
-		time.Sleep(1 * time.Second)
-	}
-
-	// Read the exit code
-	exitRaw, err = ioutil.ReadFile(exitCodePath)
-	if err != nil {
-		log.Printf("Error executing: %s", err)
-		exitStatus = 254
-		goto REMOTE_EXIT
-	}
-
-	exitStatusRaw, err = strconv.ParseInt(string(bytes.TrimSpace(exitRaw)), 10, 0)
-	if err != nil {
-		log.Printf("Error executing: %s", err)
-		exitStatus = 254
-		goto REMOTE_EXIT
-	}
-	exitStatus = int(exitStatusRaw)
-	log.Printf("Executed command exit status: %d", exitStatus)
 
 REMOTE_EXIT:
 	// Wait for the tail to finish
