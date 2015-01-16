@@ -310,7 +310,7 @@ func (c *Communicator) run(cmd *exec.Cmd, remote *packer.RemoteCmd, stdin_w io.W
 				log.Printf("Executed command exit status: %d", exitStatus)
 				goto REMOTE_EXIT
 							
-			case <- time.After( 10 * time.Minute ) : 
+			case <- time.After( 60 * time.Minute ) : 
 				log.Printf("Timer Expired, Build failed" )
 				goto REMOTE_EXIT
 				
